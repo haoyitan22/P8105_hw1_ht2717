@@ -1,0 +1,278 @@
+---
+title: "p8105_hw2_ht2717"
+author: "Haoyi Tan"
+output: html_document
+---
+```{r}
+# ---- setup ----
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# 如果误入 data/ 目录，自动退回项目根目录
+if (basename(getwd()) == "data") setwd("..")
+
+library(tidyverse)   # dplyr / tidyr / readr 等
+library(lubridate)
+library(readxl)
+library(janitor)
+
+
+```
+#Problem 1:
+
+```{r}
+pols <- read_csv("pols-month.csv") |>
+  separate(mon, into = c("year","month","day"), sep = "-", convert = TRUE) |>
+  mutate(
+    month = month(as.integer(month), label = TRUE, abbr = FALSE) |>
+            as.character() |> tolower(),
+    president = case_when(
+      prez_gop == 1 ~ "gop",
+      prez_dem == 1 ~ "dem",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  select(-day, -prez_gop, -prez_dem)
+```
+
+```{r}
+snp <- read_csv("snp.csv") |>
+  mutate(date = mdy(date)) |>
+  transmute(
+    year  = year(date),
+    month = month(date, label = TRUE, abbr = FALSE) |> as.character() |> tolower(),
+    close
+  ) |>
+  arrange(year, match(month, tolower(month.name)))
+
+```
+```{r}
+unemp <- read_csv("unemployment.csv") |>
+  rename(year = Year) |>
+  pivot_longer(
+    cols = -year,
+    names_to = "mon_abb",
+    values_to = "unemployment"
+  ) |>
+  mutate(
+    # mon_abb 形如 "Jan"..."Dec" -> 转成完整月名
+    month = tolower(month.name[match(mon_abb, month.abb)])
+  ) |>
+  select(year, month, unemployment) |>
+  arrange(year, match(month, tolower(month.name)))
+
+```
+```{r}
+merged <- pols |>
+  left_join(snp,   by = c("year","month")) |>
+  left_join(unemp, by = c("year","month"))
+
+```
+
+The pols dataset contains information on the number of national politicians who were Democrats or Republicans each month, along with an indicator of the president’s party. The snp dataset provides the monthly closing values of the S&P 500 index, giving a measure of stock market performance. The unemployment dataset reports the national unemployment rate by year and month. After cleaning and merging these three sources by year and month, the resulting dataset has r dim(merged)[1] rows and r dim(merged)[2] columns, spanning the years r min(merged$year, na.rm=TRUE) to r max(merged$year, na.rm=TRUE). Key variables include year, month, president (party of the president), close (S&P 500 closing value), and unemployment (monthly unemployment rate).
+
+
+#Problem2
+```{r}
+clean_tw <- function(sheet_name, wheel_label) {
+
+  df <- read_excel("202509 Trash Wheel Collection Data.xlsx",
+                   sheet = sheet_name, skip = 1) |>
+    clean_names() |>
+    filter(!is.na(dumpster))        # 只保留有数据的行
+
+  # --- 统一 year 类型（避免 bind_rows 报 character vs double）---
+  if ("year" %in% names(df)) df <- df |> mutate(year = as.integer(year))
+  if ("yea"  %in% names(df)) df <- df |> mutate(year = as.integer(yea)) |> select(-yea)
+
+  # --- Sports：改名并四舍五入为整数 ---
+  if ("sports" %in% names(df)) {
+    df <- df |> mutate(sports_balls = as.integer(round(sports)))
+  } else if ("sports_balls" %in% names(df)) {
+    df <- df |> mutate(sports_balls = as.integer(round(sports_balls)))
+  } else {
+    df <- df |> mutate(sports_balls = NA_integer_)
+  }
+
+  # --- Cigarette：改名为 cigarette_butts ---
+  if ("cigarette_butts" %in% names(df)) {
+    # keep
+  } else if ("cigarette" %in% names(df)) {
+    df <- df |> rename(cigarette_butts = cigarette)
+  } else {
+    df <- df |> mutate(cigarette_butts = NA_integer_)
+  }
+
+  # --- 重量 / 体积列：标准化命名 ---
+  if (!"weight_tons" %in% names(df) && "weight" %in% names(df)) {
+    df <- df |> rename(weight_tons = weight)
+  }
+  if (!"volume_cubic_yards" %in% names(df)) {
+    vol_col <- names(df)[stringr::str_detect(names(df), "^volume")]
+    if (length(vol_col)) df <- df |> rename(volume_cubic_yards = !!vol_col[1])
+  }
+
+  # --- 两个 Plastic 列：重命名更清晰（bottles / bags）---
+  if ("plastic"   %in% names(df)) df <- df |> rename(plastic_bottles = plastic)
+  if ("plastic_2" %in% names(df)) df <- df |> rename(plastic_bags    = plastic_2)
+
+  # --- 统一日期：优先用 date；否则用 year/month/(day) 组装 ---
+  if ("date" %in% names(df)) {
+    df <- df |> mutate(date = as.Date(date))
+  } else if ("year" %in% names(df) & "month" %in% names(df)) {
+    df <- df |>
+      mutate(
+        month_num = match(month, month.name),    # 英文月名 → 数字
+        day_val   = if ("day" %in% names(df)) day else 1,
+        date      = lubridate::make_date(year, month_num, day_val)
+      ) |>
+      select(-month_num, -day_val)
+  }
+
+  # --- 输出整洁列并加上 wheel 标签 ---
+  df |>
+    mutate(wheel = wheel_label) |>
+    select(
+      wheel, dumpster, date,
+      year = any_of("year"), month = any_of("month"),
+      weight_tons, volume_cubic_yards,
+      plastic_bottles = any_of("plastic_bottles"),
+      plastic_bags    = any_of("plastic_bags"),
+      polystyrene = any_of("polystyrene"),
+      glass       = any_of("glass"),
+      wrapper     = any_of("wrapper"),
+      cigarette_butts, sports_balls,
+      homes = any_of("homes"),
+      everything()
+    )
+}
+
+# ---- 分 sheet 清洗并合并（第三个 sheet 名：Gwynns Falls Trash Wheel）----
+mr   <- clean_tw("Mr. Trash Wheel",           "Mr")
+prof <- clean_tw("Professor Trash Wheel",     "Professor")
+gwyn <- clean_tw("Gwynns Falls Trash Wheel",  "Gwynnda")
+
+trash_all <- bind_rows(mr, prof, gwyn) |>
+  janitor::remove_empty(c("rows","cols"))
+
+# ---- 题目要求的三个量 ----
+# (1) 合并后总观测数
+n_obs_trash <- nrow(trash_all)
+
+# (2) Professor Trash Wheel 收集垃圾总重量（吨）
+prof_total_weight <- trash_all |>
+  dplyr::filter(wheel == "Professor") |>
+  dplyr::summarize(total_tons = sum(weight_tons, na.rm = TRUE)) |>
+  dplyr::pull(total_tons)
+
+# (3) Gwynnda 在 2022 年 6 月的 cigarette_butts 总数
+gwyn_cigs_2022_06 <- trash_all |>
+  mutate(
+    yr = coalesce(year, lubridate::year(date)),
+    mo = coalesce(match(month, month.name), lubridate::month(date))
+  ) |>
+  filter(wheel == "Gwynnda", yr == 2022, mo == 6) |>
+  summarize(tot = sum(cigarette_butts, na.rm = TRUE)) |>
+  pull(tot)
+
+```
+We imported and standardized three sheets from “202509 Trash Wheel Collection Data.xlsx”: Mr. Trash Wheel, Professor Trash Wheel, and Gwynns Falls Trash Wheel (labeled “Gwynnda”). The raw tables record the dumpster ID and date (or year/month), along with weight (tons), volume (cubic yards), and counts of specific items: plastic (two columns in some sheets, recorded as bottles and bags), polystyrene, glass, wrappers, cigarette (standardized to cigarette_butts), and sports (standardized to sports_balls). After cleaning and combining, the tidy dataset contains r n_obs_trash observations (each representing one dumpster load). Professor Trash Wheel has collected r round(prof_total_weight, 2) tons of trash in total. In June 2022, Gwynns collected r gwyn_cigs_2022_06 %||% 0 cigarette butts.
+
+#Problem 3
+```{r}
+# 1. 读取数据
+zori_file <- list.files(pattern = "(?i)^zip_zori_.*month.*\\.csv$")
+meta_file <- list.files(pattern = "(?i)^zip\\s*codes\\.csv$")
+
+zori_raw <- read_csv(zori_file[1]) |> clean_names()
+meta_raw <- read_csv(meta_file[1]) |> clean_names()
+
+# 2. 找到 ZIP 列
+zip_col <- c("region_name","zip","zipcode","zip_code")[
+  c("region_name","zip","zipcode","zip_code") %in% names(zori_raw)
+][1]
+
+# 3. 识别日期列 (列名类似 x2015_01_31)
+date_cols <- names(zori_raw)[
+  str_detect(names(zori_raw), "^x?\\d{4}[-_.]\\d{2}([-_.]\\d{2})?$")
+]
+
+# 4. 宽转长并清洗
+zori_long <- zori_raw |>
+  pivot_longer(
+    cols = all_of(date_cols),
+    names_to = "date_str_raw",
+    values_to = "zori"
+  ) |>
+  mutate(
+    date_str = str_remove(date_str_raw, "^x"),         # 去掉前缀 x
+    date_str = str_replace_all(date_str, "[-_.]", "-"),# 统一分隔符
+    date = if_else(nchar(date_str) == 7, as.Date(ym(date_str)), as.Date(ymd(date_str)))
+  ) |>
+  rename(zip = !!zip_col) |>
+  mutate(
+    year  = year(date),
+    month = month(date, label = TRUE, abbr = FALSE) |> as.character() |> tolower()
+  ) |>
+  select(zip, date, year, month, zori)
+
+# 5. 清洗 ZIP 元数据
+meta <- meta_raw |>
+  rename(
+    zip         = any_of(c("zip","zipcode","zip_code","region_name")),
+    borough     = any_of(c("borough","county","boro")),
+    neighborhood= any_of(c("neighborhood","neighbourhood","nhood","area"))
+  ) |>
+  select(any_of(c("zip","borough","neighborhood"))) |>
+  distinct()
+
+# 6. 合并
+zori_nyc <- zori_long |> left_join(meta, by = "zip") |> arrange(zip, date)
+
+# 7. 数据规模
+n_obs_p3 <- nrow(zori_nyc)
+n_zip    <- n_distinct(zori_nyc$zip)
+n_hood   <- n_distinct(zori_nyc$neighborhood)
+drange   <- range(zori_nyc$date, na.rm = TRUE)
+
+# 8. 找出 meta 里有但 zori 没的 ZIP
+missing_in_zori <- anti_join(
+  meta |> filter(!is.na(zip)) |> distinct(zip),
+  zori_long |> distinct(zip),
+  by = "zip"
+) |> left_join(meta, by = "zip")
+
+# 9. 计算 2021-01 vs 2020-01 跌幅
+zori_month <- zori_nyc |>
+  mutate(month_start = floor_date(date, "month")) |>
+  group_by(zip, borough, neighborhood, month_start) |>
+  summarize(zori = first(zori), .groups = "drop")
+
+drop_tbl <- zori_month |>
+  filter(month_start %in% c(ym("2020-01"), ym("2021-01"))) |>
+  pivot_wider(names_from = month_start, values_from = zori, names_prefix = "d_") |>
+  mutate(drop_2021_vs_2020 = `d_2021-01-01` - `d_2020-01-01`) |>
+  arrange(drop_2021_vs_2020) |>
+  slice(1:10)
+
+# 10. 展示表格
+knitr::kable(drop_tbl, caption = "Top 10 ZIP codes with largest ZORI drop (Jan 2021 vs Jan 2020)")
+```
+
+The Zillow Observed Rent Index (ZORI) dataset for New York City provides monthly rental price estimates across ZIP codes from January 2015 to August 2024. After cleaning and merging with the ZIP code metadata file, the final tidy dataset contains r n_obs_p3 observations, covering r n_zip unique ZIP codes and r n_hood unique neighborhoods.
+
+Key variables include:
+
+zip – ZIP code
+
+date – month of observation
+
+zori – Zillow Observed Rent Index value
+
+borough – borough (county)
+
+neighborhood – neighborhood name
+
+Some ZIP codes appear in the ZIP code metadata but not in the ZORI dataset. These typically correspond to PO Box–only areas, commercial/industrial zones, or regions with insufficient rental market data, explaining their exclusion from Zillow’s rental index.
+
+When comparing rents in January 2021 to January 2020, we observe significant declines during the COVID-19 pandemic. The 10 ZIP codes with the largest rent drops are concentrated in high-density rental areas such as Manhattan and Brooklyn, reflecting the sharp fall in demand for urban rentals during the pandemic.
+
